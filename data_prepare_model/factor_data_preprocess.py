@@ -5,7 +5,7 @@
 @author: Dly
 @version: 1.0.0
 @license: Apache Licence
-@file: factor_data_prepare.py
+@file: factor_data_preprocess.py
 @time: 2022/2/10 16:31
 """
 import pandas as pd
@@ -91,37 +91,71 @@ class DataPreprocess(object):
         Returns:
 
         """
-
-        # # 市值中性化
-        factor_value_df = pd.DataFrame(index=factor_data.stack().index)
+        index_name_list = ['date', 'code']
+        if isinstance(factor_data, pd.DataFrame):
+            merge_factor_data = pd.DataFrame(factor_data.stack().rename_axis(index_name_list).rename('factor_data'))
+        else:
+            merge_factor_data = pd.DataFrame(factor_data.rename('factor_data'))
         # 市值和行业中性化
-        _factor_value = pd.DataFrame(index=factor_data.stack().index)
-        _dummies_variable = pd.DataFrame(index=factor_data.stack().index).rename_axis(['date', 'code'])
+        logger.info('处理市值、行业因子数据')
         if len(factor_value_list) > 0:
             for factor_value in factor_value_list:
                 factor_value_standard = cls.data_standardize(factor_value, standard_method='z_score')
-                _factor_value = pd.merge(_factor_value, factor_value_standard.stack().rename('factor_value'),
-                                         how='inner', right_index=True, left_index=True)
+                if isinstance(factor_value_standard, pd.DataFrame):
+                    factor_value_standard = factor_value_standard.stack().rename_axis(index_name_list).rename(
+                        'factor_value')
+                else:
+                    factor_value_standard = factor_value_standard.rename('factor_value')
+                merge_factor_data = pd.merge(merge_factor_data, factor_value_standard,
+                                             how='inner', right_index=True, left_index=True)
         if len(dummies_variable) > 0:
             for dummies in dummies_variable:
-                dummies_ = pd.get_dummies(dummies.set_index(['date', 'code']))
-                _dummies_variable = pd.merge(_dummies_variable.rename_axis(['date', 'code']), dummies_, how='inner',
-                                             right_index=True, left_index=True)
+                if isinstance(dummies, pd.DataFrame):
+                    dummies_ = pd.get_dummies(dummies.set_index(index_name_list))
+                else:
+                    dummies_ = pd.get_dummies(dummies)
+                merge_factor_data = pd.merge(merge_factor_data, dummies_, how='inner', right_index=True,
+                                             left_index=True)
 
-        factor_value_df = pd.merge(factor_value_df.rename_axis(['date', 'code']),
-                                   pd.merge(_factor_value.rename_axis(['date', 'code']), _dummies_variable,
-                                            how='inner', left_index=True, right_index=True), how='inner',
-                                   left_index=True, right_index=True)
-        merge_factor_data = pd.merge(factor_data.stack().rename_axis(['date', 'code']).rename('factor_data'),
-                                     factor_value_df.rename_axis(['date', 'code']), how='inner', right_index=True,
-                                     left_index=True)
-        # 回归求残差
+        logger.info('处理权重数据')
+        if isinstance(weights, pd.DataFrame):
+            weights = weights.stack().rename_axis(index_name_list).rename('weights')
+        else:
+            weights = weights.rename('weights')
+        merge_factor_data = pd.merge(merge_factor_data, weights, how='inner', right_index=True, left_index=True)
+
+        column_list = merge_factor_data.columns.unique().to_list()
+        x_column_list = list(set(column_list).difference(['factor_data', 'weights']))
         res_df = pd.DataFrame()
-        columns_list = merge_factor_data.columns.unique().to_list()
-        columns_list.remove('factor_value')
-        for dt, grouped in merge_factor_data.groupby(['date']):
-            y = grouped['factor_value'].values
-            x = grouped[columns_list]
+        logger.info('回归求取残差')
+        if isinstance(factor_data, pd.DataFrame):
+            merge_factor_data = merge_factor_data
+            for dt, grouped in merge_factor_data.groupby(merge_factor_data.index.get_level_values(0)):
+                y = grouped['factor_data']
+                x = grouped[x_column_list]
+                if add_constant:
+                    x = sm.add_constant(x)
+                # 最小二乘法
+                if regress_method == 'OLS':
+                    model = sm.OLS(y, x)
+                # 加权最小二乘法
+                elif regress_method == 'WLS':
+                    if weights is None:
+                        raise ValueError("使用WLS方法, 权重weights不能为空")
+                    model = sm.WLS(y, x, weights=merge_factor_data['weights'])
+
+                # 稳健回归
+                elif regress_method == 'RLM':
+                    model = sm.RLM(y, x, M=sm.robust.norms.HuberT())
+                else:
+                    raise ValueError("输入的标准化方法必须在['OLS', 'WLS', 'RLM']之内")
+
+                res = model.fit()
+                res_df = res_df.append(pd.DataFrame(res.resid))
+
+        else:
+            y = merge_factor_data['factor_data']
+            x = merge_factor_data[x_column_list]
             if add_constant:
                 x = sm.add_constant(x)
             # 最小二乘法
@@ -131,7 +165,7 @@ class DataPreprocess(object):
             elif regress_method == 'WLS':
                 if weights is None:
                     raise ValueError("使用WLS方法, 权重weights不能为空")
-                model = sm.WLS(y, x, weights=weights.loc[dt])
+                model = sm.WLS(y, x, weights=merge_factor_data['weights'])
 
             # 稳健回归
             elif regress_method == 'RLM':
@@ -140,9 +174,9 @@ class DataPreprocess(object):
                 raise ValueError("输入的标准化方法必须在['OLS', 'WLS', 'RLM']之内")
 
             res = model.fit()
-            res_df = res_df.append(pd.DataFrame(res.resid))
+            res_df = res.resid
 
-        return res_df.unstack()
+        return res_df
 
 
 if __name__ == '__main__':
@@ -178,9 +212,18 @@ if __name__ == '__main__':
     factor_data_ = pd.Series([0.784, 0.283, 0.96, 0.443, 0.805, 0.942, 0.942, 0.464, 0.443, 0.358],
                              index=['00001', '00002', '00003', '00004', '00005', '00006', '00007', '00008',
                                     '00009', '00010'])
-    print(data_prepare.data_standardize(factor_data=factor_data_, standard_method='z_score'))
-    # data_prepare.data_neutralization(factor_value_list=[market_factor], dummies_variable=[ind_factor],
-    #                                  regress_method='OLS')
-    # res = data_prepare.data_neutralization(factor_data=factor_data_, factor_value_list=[market_factor],
-    #                                        regress_method='OLS', weights=weight, add_constant=True)
-    # print(res)
+
+    market_factor = pd.Series([0.179, 0.269, 0.2, 0.617, 0.433, 0.224, 0.796, 0.63, 0.838, 0.921],
+                              index=['00001', '00002', '00003', '00004', '00005', '00006', '00007', '00008',
+                                     '00009', '00010'])
+    ind_factor = pd.Series(['A', 'A', 'B', 'A', 'C', 'B', 'D', 'A', 'C', 'A'],
+                           index=['00001', '00002', '00003', '00004', '00005', '00006', '00007', '00008',
+                                  '00009', '00010'])
+    weight = pd.Series([0.1, 0.2, 0.3, 0.4, 0.5, 0.4, 0.6, 0.4, 0.8, 0.2],
+                       index=['00001', '00002', '00003', '00004', '00005', '00006', '00007', '00008',
+                              '00009', '00010'])
+    # print(data_prepare.data_standardize(factor_data=factor_data_, standard_method='z_score'))
+    res = data_prepare.data_neutralization(factor_data=factor_data_, factor_value_list=[market_factor],
+                                           dummies_variable=[ind_factor],
+                                           regress_method='OLS', weights=weight, add_constant=True)
+    print(res)
